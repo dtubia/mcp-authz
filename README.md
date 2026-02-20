@@ -1,9 +1,6 @@
 # Authorization Server as PDP for Tool-Scoped MCP Access: Audience-Bound Tokens and Deterministic PEP Enforcement
 
-| | |
-|---|---|
-| **Author** | David Tubía |
-| **Date** | 2026-02-20 |
+*David Tubía | 2026-02-20*
 
 ## Abstract
 
@@ -48,16 +45,16 @@ This paper assumes modern OAuth/OIDC foundations (confidential clients, TLS ever
 
 The mitigations below are intentionally biased toward deterministic, local enforcement at PEPs (gateways, agent runtimes, MCP servers) using tokens minted by a single PDP (the Authorization Server / IdP). The goal is a simple and verifiable contract: a signed token is a decision artifact, and the PEP does exact matching between request context (resource + tool) and token claims.
 
-_Threats and mitigations for tool-scoped MCP authorization._
-
-| Threat (MCP authn/authz) | Primary PEP/PDP control | Secondary (optional hardening) |
-|---|---|---|
+| **Threat (MCP authn/authz)** | **Primary PEP/PDP control** | **Secondary (optional hardening)** |
+| --- | --- | --- |
 | Prompt-induced tool abuse | Pre-exec policy check (PEP calling PDP): treat planner output as untrusted; validate tool args against schema and enforce per-tool/action allow policies | HITL for high-privilege or irreversible actions |
 | Confused deputy (token passthrough / transitive privilege) | Validate OAuth2.1/OIDC on every call (iss/aud/exp/sig) + prohibit token passthrough; use OBO/token delegation | Centralize policy enforcement (gateway PDP) for consistent authz/consent/tool filtering |
 | Token replay | Short-lived, narrowly scoped tokens; revalidate per call before tool/resource execution | `jti`/nonce tracking + sender-constrained tokens (e.g., DPoP/mTLS where feasible) |
 | Audience misuse | Strict `aud` enforcement at the PEP before any tool execution | Signed intent binding (subject, audience, purpose, session); reject mismatches |
 | Naming confusion / tool alias collisions | Enforce fully-qualified tool identifiers and fail-closed on ambiguity | Require explicit disambiguation and/or re-consent for ambiguous resolution |
 | Scope escalation (delegation chains / permission creep) | Task-scoped, time-bound permissions with explicit permission boundaries; per-action authorization via centralized PDP | Bind permissions to subject/resource/purpose/duration; prevent privilege inheritance unless intent is re-validated |
+
+*Table: Threats and mitigations for tool-scoped MCP authorization.*
 
 
 ## 2. Background
@@ -181,30 +178,32 @@ Tool enforcement should not be re-implemented in every MCP server and agent. Pre
 
 ## 5. Architecture patterns
 
-### 5.1 Gateway-enforced tool authorization
+### 5.1 Gateway-enforced authorization (Agent Gateway + MCP Gateway)
 
-We model two enforcement boundaries:
+We model two enforcement boundaries. Both are **PEPs** (Policy Enforcement Points): they perform deterministic verification on the request and the token. The **AS/IdP remains the PDP** (Policy Decision Point) by deciding which claims appear in the token at issuance time.
 
-- PEP #1 (optional): before the agent (protects the agent API itself).
-- PEP #2 (recommended): before MCP servers (protects tool calls).
+- **PEP #1 (Agent Gateway, recommended):** sits in front of the agent runtime. It enforces that callers hold a token minted for the **agent resource** by validating the JWT and requiring an **audience match** against the gateway's canonical RFC 8707 resource URL. This keeps authentication/authorization out of agent code (developers do not become accidental security engineers).
+- **PEP #2 (MCP Gateway, recommended):** sits in front of MCP servers. It validates the JWT and performs **tool-level authorization** by matching the requested MCP tool name against claims (scope / tool_permissions) that the AS emitted.
 
-High-level ASCII architecture:
+In practice, PEP #1 and PEP #2 can be deployed as **two separate gateways** or as a **single shared gateway** with two logical policies. The key invariant is the same: *the token is minted for the resource being called, and the PEP checks that deterministically*.
+
+Option A: two gateways (distinct audiences)
 
 ```text
                  +-----------------------------+
                  | Authorization Server (AS)   |
                  | - OAuth/OIDC               |
-                 | - PDP: roles -> tools      |
+                 | - PDP: roles -> claims     |
                  | - Token Exchange (OBO)     |
                  +--------------+--------------+
                                 ^
                                 |
         (1) token for agent     | (2) token exchange for MCP (downscoped)
                                 |
-+-------------------+     +-----+-----+      +-------------------+
-| Client Backend     |---->| PEP #1    |----->| Agent Runtime      |
-| (confidential)     |     | (optional)|      | - planner/tool use |
-+-------------------+     +-----------+      +---------+---------+
++-------------------+     +-----+-----------+      +-------------------+
+| Client Backend     |---->| PEP #1         |----->| Agent Runtime      |
+| (confidential)     |     | (Agent GW)     |      | - planner/tool use |
++-------------------+     +-----+-----------+      +---------+---------+
                                                     |
                                                     | (3) MCP JSON-RPC
                                                     v
@@ -219,6 +218,215 @@ High-level ASCII architecture:
                                              | (tools)     |
                                              +-------------+
 ```
+
+Option B: one shared gateway (two logical PEP roles)
+
+When you prefer a single governed data plane, you can run one gateway and publish two **resource identifiers** (RFC 8707) on the same host (path-scoped resources are fine):
+
+- Agent API resource: `https://gw.example.com/agent`
+- MCP API resource: `https://gw.example.com/mcp` (optionally per upstream: `https://gw.example.com/mcp/<server>` or `https://gw.example.com/mcp/<tenant>`)
+
+```text
+                 +-----------------------------+
+                 | Authorization Server (AS)   |
+                 | - OAuth/OIDC               |
+                 | - PDP: roles -> claims     |
+                 | - Token Exchange (OBO)     |
+                 +--------------+--------------+
+                                ^
+                                |
++-------------------+  AT_agent |     +-------------------+      +-------------+
+| Client Backend     |-----------+---->| Unified Gateway    |----->| Agent       |
+| (confidential)     | (aud=/agent)    | - PEP #1 (/agent)  |<---- | Runtime     |
++-------------------+                 | - PEP #2 (/mcp)    |      +------+------+
+                                     +---------+---------+   AT_mcp (aud=/mcp)          
+                                               |                        
+                                               | /mcp JSON-RPC         
+                                               +-------------------> +---+--------+
+                                                                        | MCP Server |
+                                                                        | (tools)    |
+                                                                        +------------+
+```
+
+This deployment strengthens governance: the security team owns a single gateway policy plane that fronts **both** the agent API and the MCP API, while the AS/IdP remains the single source of truth for *who can get which claims*. The gateway becomes a governed PEP layer (ideally shared) that performs deterministic checks and then routes to the protected agent runtime and MCP servers.
+
+
+#### 5.1.1 Gateway resource identifiers vs upstream routing (who validates `aud`?)
+
+A subtle but important question in shared-gateway deployments is: what is the *protected resource* for the purposes of RFC 8707 audience restriction? Is it the **gateway URL** the client calls, or the **upstream agent / MCP server** that ultimately executes the request?
+
+This matters because audience validation is mandatory: OAuth Security BCP requires access tokens to be audience-restricted to a specific resource server (or, if not feasible, a small set) and requires every resource server to verify the intended audience on every request (RFC 9700). Resource Indicators (RFC 8707) similarly assume the client requests a token for the location where it intends to use it, and warns that access tokens that are valid for multiple resources/audiences require high trust between recipients.
+
+If you mint a token with `aud=https://gw.example.com/mcp/acme` (because the client is calling that gateway endpoint) and then you forward that *same bearer token* to an upstream MCP server that expects `aud=https://mcp-acme.example.com/mcp`, the upstream will (correctly) deny the request on audience mismatch. That is not a bug; it is the mechanism working as designed.
+
+In practice, you have three deployable patterns. The "most correct" choice is not a philosophical one: it depends on whether you want the upstream to be a first-class OAuth resource server, and how hard you want to push defense-in-depth.
+
+| **Pattern** | **What the token targets** | **Notes (security + ops)** |
+| --- | --- | --- |
+| P1. Gateway is the OAuth resource server (terminate at GW) | `aud = gw URL` (path-scoped per agent/MCP endpoint) | Upstreams are not publicly reachable; GW enforces `aud`/`scope`/tool claims and routes internally. Protect GW-to-upstream with mTLS/ACLs/service mesh. Simplest and usually preferred. |
+| P2. Gateway performs token exchange (downstream token mediation) | Inbound: `aud = gw`; downstream: `aud = upstream` | GW validates inbound token, then uses RFC 8693 token exchange to mint a new, short-lived token for the upstream resource (optionally downscoped). Enables defense-in-depth. Adds latency/AS load. Requires strict allowlists and downscoping to prevent exchange abuse. |
+| P3. Multi-audience token (`aud[]` includes GW and upstream) | `aud = [gw, upstream]` | Possible with JWT and some AS policies, but increases blast radius. RFC 8707 warns multi-audience bearer tokens require high trust between recipients; RFC 9700 recommends audience restriction to a specific RS or a small set. Only consider when upstream is not directly reachable and the trust boundary is strong. |
+
+*Table: Gateway-to-upstream audience patterns for RFC 8707-style resource identifiers.*
+
+##### Pattern P1: Gateway terminates OAuth; upstream is private
+
+This is the classic API gateway model: the gateway is the resource server, and the upstream is an internal component. The access token is minted for the gateway's canonical URL (the URL the client actually calls), and only the gateway performs OAuth validation. The upstream is protected by network-layer controls (mTLS, ACLs, private subnets) and trusts the gateway.
+
+Key properties:
+
+- Tokens are usable only at the gateway URLs (path-scoped resource identifiers are fine).
+- Upstreams never accept client-issued bearer tokens directly (they either never see them, or they ignore them).
+- Compromise of an upstream is less valuable because it cannot be accessed directly from outside the gateway boundary.
+
+Illustrative trace (resource indicators + tool-scoped scope):
+
+**Request: Agent -> AS: token_exchange (target GW MCP resource)**
+
+```http
+POST /oauth2/token HTTP/1.1
+Host: as.example.com
+Content-Type: application/x-www-form-urlencoded
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange&
+subject_token=AT_agent&
+subject_token_type=urn:ietf:params:oauth:token-type:access_token&
+resource=https%3A%2F%2Fgw.example.com%2Fmcp%2Facme&
+scope=mcp.call_tool%20inventory.get%20quote.read&
+intent_id=ord-2026-000125
+```
+
+**Response: AS -> Agent: AT_mcp_gw (decoded JWT sketch)**
+
+```json
+{
+"iss":"https://as.example.com",
+"sub":"agent_runtime",
+"aud":"https://gw.example.com/mcp/acme",
+"exp":1760669100,
+"scope":"mcp.call_tool inventory.get quote.read",
+"tool_permissions":[
+{"tool":"inventory.get","actions":["invoke"]},
+{"tool":"quote.read","actions":["invoke"]}
+],
+"act":{"sub":"agent_runtime","typ":"service"}
+}
+```
+
+**Request: Agent -> GW (/mcp/acme): tools/call (token targets GW)**
+
+```http
+POST /mcp/acme HTTP/1.1
+Host: gw.example.com
+Authorization: Bearer AT_mcp_gw
+Content-Type: application/json
+{
+"jsonrpc":"2.0",
+"id":"p1-1",
+"method":"tools/call",
+"params":{
+"name":"inventory.get",
+"arguments":{"sku":"X-42"}
+}
+}
+```
+
+At this point the GW enforces `aud` (exact match against the canonical GW URL) and tool scope (exact match against `inventory.get`). The GW then proxies the request to the upstream MCP server over a private channel (mTLS, ACLs). The upstream does *not* need to validate the client token because, in this pattern, it is not an OAuth resource server.
+
+##### Pattern P2: Gateway performs token exchange for the upstream resource
+
+If you want the upstream to also validate OAuth tokens (defense-in-depth, stronger tenant boundaries, or independent upstream ownership), the GW can act as a confidential OAuth client and mint an *upstream-specific* token via RFC 8693 token exchange.
+
+Operationally, the GW:
+
+1. validates the inbound token for its own resource identifier,
+2. performs token exchange using the inbound token as `subject_token`,
+3. requests a new token with `resource=<upstream URL>` and a strict subset of scopes,
+4. forwards to the upstream with the exchanged token.
+
+This is explicitly covered by RFC 8693: a resource server can assume the role of client and exchange an incoming access token for a token usable at a backend service.
+
+Illustrative trace:
+
+**Request: GW -> AS: token_exchange (mint upstream token)**
+
+```http
+POST /oauth2/token HTTP/1.1
+Host: as.example.com
+Authorization: Basic Z3c6Li4u  % gw client creds
+Content-Type: application/x-www-form-urlencoded
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange&
+subject_token=AT_mcp_gw&
+subject_token_type=urn:ietf:params:oauth:token-type:access_token&
+resource=https%3A%2F%2Fmcp-acme.internal.example.net%2Fmcp&
+scope=mcp.call_tool%20inventory.get&
+intent_id=ord-2026-000125
+```
+
+**Response: AS -> GW: AT_mcp_upstream (decoded JWT sketch)**
+
+```json
+{
+"iss":"https://as.example.com",
+"sub":"agent_runtime",
+"aud":"https://mcp-acme.internal.example.net/mcp",
+"exp":1760668860,
+"scope":"mcp.call_tool inventory.get",
+"act":{"sub":"gw.example.com","typ":"pepgateway"}
+}
+```
+
+**Request: GW -> Upstream MCP: tools/call (token targets upstream)**
+
+```http
+POST /mcp HTTP/1.1
+Host: mcp-acme.internal.example.net
+Authorization: Bearer AT_mcp_upstream
+Content-Type: application/json
+{
+"jsonrpc":"2.0",
+"id":"p2-1",
+"method":"tools/call",
+"params":{
+"name":"inventory.get",
+"arguments":{"sku":"X-42"}
+}
+}
+```
+
+Security notes for P2:
+
+- Treat token exchange as a privileged operation. Enforce allowlists (which clients can exchange, which targets are allowed) and strict downscoping. Otherwise token exchange becomes a lateral movement primitive.
+- Cache exchanged tokens aggressively (short TTL, per (subject, intent, target, scope) tuple) to control latency and AS load.
+- Prefer sender-constrained tokens (mTLS/DPoP) for the GW-to-upstream token to reduce replay risk.
+
+##### Pattern P3: Mint a multi-audience access token (`aud[]` contains GW and upstream)
+
+JWT permits `aud` to be an array, and RFC 9068 carries JWT semantics into access tokens. Some deployments mint a single token that is valid both at the GW URL and at the upstream URL:
+
+```json
+"aud": ["https://gw.example.com/mcp/acme", "https://mcp-acme.example.com/mcp"]
+```
+
+This makes it possible for both the GW and the upstream to accept the same token. It can be practical, but it expands the blast radius of token leakage: any holder can potentially use the token at *either* audience. RFC 8707 explicitly warns that multi-audience access tokens require a high level of trust between the audiences, and RFC 9700 recommends audience restriction to a specific resource server (or a small set) as a core mitigation against token phishing and leakage.
+
+If you adopt P3, treat it as an optimization for controlled environments, and combine it with strong mitigations:
+
+- Upstreams must not be publicly reachable (otherwise you enable bypass of the gateway).
+- Use sender-constrained tokens where possible.
+- Keep TTLs short and bind tokens to a transaction window (`intent_id`, `jti`, etc).
+- Use resource-qualified tool permissions (see Section 6.3) to avoid confused-deputy behavior when `aud[]` covers multiple protected resources.
+
+
+Minimum enforcement at PEP #1 (Agent Gateway)
+
+1. Verify JWT signature and standard claims (`iss`, `exp`/`nbf`, `iat`) and reject unsigned/invalid tokens.
+2. Compute the expected resource identifier for the incoming request and require an **exact match** with one of the token audiences:
+   - Separate gateways: expected `aud` = `https://agent-gw.example.com`
+   - Shared gateway: expected `aud` = `https://gw.example.com/agent`
+3. (Optional but practical) Require a coarse scope like `agent.invoke` to prevent accidental use of unrelated tokens.
+
+No parsing of MCP tool payload is required at PEP #1. Tool-level authorization is enforced at PEP #2.
+
 
 ### 5.2 Deny-path diagram (tool mismatch)
 
@@ -274,7 +482,7 @@ Assume JWT access tokens. We define a minimal contract; you can add more claims 
 
 ### 6.1 Token used to call the agent (AT_agent)
 
-- `aud`: canonical agent API URL (resource indicator).
+- `aud`: canonical **agent gateway** URL (resource indicator, RFC 8707). If you run a shared gateway, use a path-scoped resource such as `https://gw.example.com/agent`.
 - `client_id` (or `azp`): identifies the backend client.
 - Optional: `intent` claim (string), `intent_id` (UUID).
 
@@ -1498,47 +1706,49 @@ Decision outputs (response highlights):
 
 Token includes tenant and tenant-scoped tool:
 
-**Token includes tenant and tenant-scoped tool**
+**Request: Token includes tenant and tenant-scoped tool**
 
 ```json
 {
-  "tenant_id":"acme",
-  "tool_permissions":[{"tool":"acme.inventory.get","actions":["invoke"]}],
-  "aud":"https://mcp-gw.example.com"
+"tenant_id":"acme",
+"tool_permissions":[{"tool":"acme.inventory.get","actions":["invoke"]}],
+"aud":"https://mcp-gw.example.com"
 }
 ```
 
+
 Request for `globex.inventory.get` is denied with `tenant_mismatch`:
 
-**MCP request (cross-tenant tool)**
+**Request: MCP request (cross-tenant tool)**
 
 ```http
 POST /mcp HTTP/1.1
 Host: mcp-gw.example.com
 Authorization: Bearer AT_mcp
 Content-Type: application/json
-
 {
-  "jsonrpc":"2.0",
-  "id":"req-9.8-1",
-  "method":"tools/call",
-  "params":{
-    "name":"globex.inventory.get",
-    "arguments":{"sku":"X-42"}
-  }
+"jsonrpc":"2.0",
+"id":"req-9.8-1",
+"method":"tools/call",
+"params":{
+"name":"globex.inventory.get",
+"arguments":{"sku":"X-42"}
+}
 }
 ```
 
-**MCP gateway response**
+
+**Request: MCP gateway response**
 
 ```json
 {
-  "error":"access_denied",
-  "reason":"tenant_mismatch",
-  "token_tenant":"acme",
-  "requested_tool":"globex.inventory.get"
+"error":"access_denied",
+"reason":"tenant_mismatch",
+"token_tenant":"acme",
+"requested_tool":"globex.inventory.get"
 }
 ```
+
 
 ## 10. Candidate Authorization Servers / IdPs
 
@@ -1629,7 +1839,6 @@ This gives you deterministic behavior even when the AS does not accept `resource
 Keycloak 26.4 highlights full DPoP support. If your MCP clients and gateways can handle it, sender-constrained access tokens meaningfully reduce replay value for high-impact tools (still not a substitute for tool-level authorization).
 
 The overall recommendation stays the same: use Keycloak for what it is strong at (OIDC, token exchange, policy-managed issuance) and put protocol-aware enforcement at the gateway (PEP), with an optional external PDP for complex enterprise policy.
-
 
 
 ### 10.6 Governance: deterministic authorization needs a catalog
@@ -1725,6 +1934,8 @@ Solo.io publishes extensive agentgateway material that maps well to this paper:
 ### 12.1 Why agentgateway is relevant to tool-scoped authorization
 
 A generic reverse proxy can validate a JWT, but it usually cannot authorize "this JSON-RPC message is a tools/call for tool X". agentgateway is MCP-aware and can reason about JSON-RPC bodies, tool names, and session behavior.
+
+It also fits naturally as the **Agent Gateway (PEP #1)** in front of an agent API: the same proxy can enforce JWT validity and RFC 8707 audience pinning for agent endpoints, while still performing tool-level authorization for MCP routes (Section 5.1, Option B).
 
 The mismatch scenario becomes enforceable without modifying MCP server code:
 
@@ -2234,265 +2445,328 @@ Independent of token design, MCP servers and gateways should:
 
 The vectors below are intended to be executable against a tool-scoped MCP gateway + policy engine (PEP/PDP split). They focus on canonicalization, audience binding, replay properties, tenant namespace enforcement, and exchange monotonicity.
 
-_Sample role to tool mapping._
-
 | **Role** | **Tool IDs** |
 | --- | --- |
-| pricing\_reader | inventory.get, quote.read |
-| order\_operator | orders.create, orders.cancel, inventory.get |
-| refund\_operator | payments.refund, quote.read |
-| tenant\_supply\_acme | acme.inventory.get |
-| tenant\_supply\_globex | globex.inventory.get |
-| billing\_exporter\_v2 | billing.export.v2 |
-| break\_glass\_ops | payments.refund, orders.cancel, billing.export.v2 (short TTL, approval) |
+| pricing_reader | inventory.get, quote.read |
+| order_operator | orders.create, orders.cancel, inventory.get |
+| refund_operator | payments.refund, quote.read |
+| tenant_supply_acme | acme.inventory.get |
+| tenant_supply_globex | globex.inventory.get |
+| billing_exporter_v2 | billing.export.v2 |
+| break_glass_ops | payments.refund, orders.cancel, billing.export.v2 (short TTL, approval) |
 
-<details>
-<summary>Test vectors (22 cases).</summary>
+*Table: Sample role to tool mapping.*
 
 | **Case ID** | **Token aud** | **Token perms/scope summary** | **MCP method + name** | **Canonical(name)** | **Expected** | **Deny reason** |
 | --- | --- | --- | --- | --- | --- | --- |
-| TV-01 | mcp-gw | tp: inventory.get, quote.read | `call_tool inventory.get` | `inventory.get` | **Allow** | - |
-| TV-02 | mcp-gw | tp: inventory.get, quote.read | `call_tool payments.refund` | `payments.refund` | **Deny** | `insufficient_tool_scope` |
-| TV-03 | agent | tp: inventory.get | `call_tool inventory.get` | `inventory.get` | **Deny** | `invalid_audience` |
-| TV-04 | mcp-gw | tp: inventory.get | `call_tool Inventory.Get` | `inventory.get` | **Deny** | `non_canonical_tool_name` |
-| TV-05 | mcp-gw | tp: inventory.get | `call_tool inventry.get` | `reject` | **Deny** | `invalid_tool_name_charset` |
-| TV-06 | mcp-gw | tp: inventory.get; exp past | `call_tool inventory.get` | `inventory.get` | **Deny** | `token_expired` |
-| TV-07 | mcp-gw | tp: inventory.get; nbf future | `call_tool inventory.get` | `inventory.get` | **Deny** | `token_not_yet_valid` |
-| TV-08 | mcp-gw | issuer untrusted | `call_tool inventory.get` | `inventory.get` | **Deny** | `invalid_issuer` |
-| TV-09 | mcp-gw | signature invalid | `call_tool inventory.get` | `inventory.get` | **Deny** | `invalid_token_signature` |
-| TV-10 | mcp-gw | no tp; scope includes inventory.get | `call_tool inventory.get` | `inventory.get` | **Allow** | - |
-| TV-11 | mcp-gw | tp: inventory.get; no scope | `call_tool inventory.get` | `inventory.get` | **Allow** | - |
-| TV-12 | mcp-gw | tp+scope quote.read only | `call_tool inventory.get` | `inventory.get` | **Deny** | `insufficient_tool_scope` |
-| TV-13 | mcp-gw | tenant acme; tp acme.inventory.get | `call_tool acme.inventory.get` | `acme.inventory.get` | **Allow** | - |
-| TV-14 | mcp-gw | tenant acme; tp acme.inventory.get | `call_tool globex.inventory.get` | `globex.inventory.get` | **Deny** | `tenant_mismatch` |
-| TV-15 | mcp-gw | tp inventory.get | `call_tool inventory.get(space)` | `inventory.get` | **Deny** | `non_canonical_tool_name` |
-| TV-16 | mcp-gw | tp inventory.get | `call_tool inventory/get` | `reject` | **Deny** | `invalid_tool_name_charset` |
-| TV-17 | mcp-gw | tp billing.legacy\_export | `call_tool billing.legacy_export` | `billing.legacy_export` | **Deny** | `tool_deprecated` |
-| TV-18 | mcp-gw | tp valid; policy\_version too old | `call_tool inventory.get` | `inventory.get` | **Deny** | `policy_version_mismatch` |
-| TV-19 | exchange | subject tp inventory.get; request adds refund | `token_exchange` | `n/a` | **Deny** | `downscope_violation` |
-| TV-20 | exchange | subject tp inventory.get; request subset | `token_exchange` | `n/a` | **Allow** | - |
-| TV-21 | mcp-gw | tp quote.read; short TTL | `call_tool quote.read` | `quote.read` | **Allow** | - |
-| TV-22 | mcp-gw | tp quote.read; long TTL over policy | `call_tool quote.read` | `quote.read` | **Deny** | `ttl_exceeds_policy` |
+| TV-01 | mcp-gw | tp: inventory.get, quote.read | `call_tool inventory.get` | `inventory.get` | **\textcolor{allowGreen**{Allow}} | - |
+| TV-02 | mcp-gw | tp: inventory.get, quote.read | `call_tool payments.refund` | `payments.refund` | **\textcolor{denyRed**{Deny}} | `insufficient_tool_scope` |
+| TV-03 | agent | tp: inventory.get | `call_tool inventory.get` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `invalid_audience` |
+| TV-04 | mcp-gw | tp: inventory.get | `call_tool Inventory.Get` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `non_canonical_tool_name` |
+| TV-05 | mcp-gw | tp: inventory.get | `call_tool inventry.get` | `reject` | **\textcolor{denyRed**{Deny}} | `invalid_tool_name_charset` |
+| TV-06 | mcp-gw | tp: inventory.get; exp past | `call_tool inventory.get` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `token_expired` |
+| TV-07 | mcp-gw | tp: inventory.get; nbf future | `call_tool inventory.get` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `token_not_yet_valid` |
+| TV-08 | mcp-gw | issuer untrusted | `call_tool inventory.get` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `invalid_issuer` |
+| TV-09 | mcp-gw | signature invalid | `call_tool inventory.get` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `invalid_token_signature` |
+| TV-10 | mcp-gw | no tp; scope includes inventory.get | `call_tool inventory.get` | `inventory.get` | **\textcolor{allowGreen**{Allow}} | - |
+| TV-11 | mcp-gw | tp: inventory.get; no scope | `call_tool inventory.get` | `inventory.get` | **\textcolor{allowGreen**{Allow}} | - |
+| TV-12 | mcp-gw | tp+scope quote.read only | `call_tool inventory.get` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `insufficient_tool_scope` |
+| TV-13 | mcp-gw | tenant acme; tp acme.inventory.get | `call_tool acme.inventory.get` | `acme.inventory.get` | **\textcolor{allowGreen**{Allow}} | - |
+| TV-14 | mcp-gw | tenant acme; tp acme.inventory.get | `call_tool globex.inventory.get` | `globex.inventory.get` | **\textcolor{denyRed**{Deny}} | `tenant_mismatch` |
+| TV-15 | mcp-gw | tp inventory.get | `call_tool inventory.get(space)` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `non_canonical_tool_name` |
+| TV-16 | mcp-gw | tp inventory.get | `call_tool inventory/get` | `reject` | **\textcolor{denyRed**{Deny}} | `invalid_tool_name_charset` |
+| TV-17 | mcp-gw | tp billing.legacy_export | `call_tool billing.legacy_export` | `billing.legacy_export` | **\textcolor{denyRed**{Deny}} | `tool_deprecated` |
+| TV-18 | mcp-gw | tp valid; policy_version too old | `call_tool inventory.get` | `inventory.get` | **\textcolor{denyRed**{Deny}} | `policy_version_mismatch` |
+| TV-19 | exchange | subject tp inventory.get; request adds refund | `token_exchange` | `n/a` | **\textcolor{denyRed**{Deny}} | `downscope_violation` |
+| TV-20 | exchange | subject tp inventory.get; request subset | `token_exchange` | `n/a` | **\textcolor{allowGreen**{Allow}} | - |
+| TV-21 | mcp-gw | tp quote.read; short TTL | `call_tool quote.read` | `quote.read` | **\textcolor{allowGreen**{Allow}} | - |
+| TV-22 | mcp-gw | tp quote.read; long TTL over policy | `call_tool quote.read` | `quote.read` | **\textcolor{denyRed**{Deny}} | `ttl_exceeds_policy` |
 
-</details>
+*Table: Test vectors (22 cases).*
 
 ## Appendix D: End-to-end flows (ALLOW/DENY)
 
 This appendix provides end-to-end request traces with explicit hop boundaries. The intent is operational: you should be able to paste these into a test harness and observe the same allow/deny decisions at the AS (PDP) and at the MCP gateway (PEP).
 
-### D.1 ALLOW: client to agent to token exchange to MCP tool
 
-Step 1: backend client obtains an agent token (AT_agent).
+### D.0 DENY at Agent Gateway: audience mismatch (token confusion)
 
-**Client -> AS: client\_credentials (agent audience)**
+This failure mode is common in multi-hop systems: a caller obtains a valid token, but for the wrong resource.
+
+Step 1: backend client accidentally requests a token for the MCP gateway audience, but then uses it to call the agent.
+
+**Request: Client -> AS: client_credentials (WRONG audience)**
 
 ```http
 POST /oauth2/token HTTP/1.1
 Host: as.example.com
 Content-Type: application/x-www-form-urlencoded
-
 grant_type=client_credentials&
 client_id=backend_app&
 client_secret=...&
 scope=agent.invoke%20inventory.get%20quote.read&
-audience=https%3A%2F%2Fagent.example.com
+resource=https%3A%2F%2Fmcp-gw.example.com
 ```
 
-**AS -> Client: AT\_agent**
+**Response: AS -> Client: AT_wrong (aud=mcp-gw)**
 
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/json
-
 {
-  "access_token":"AT_agent",
-  "token_type":"Bearer",
-  "expires_in":300,
-  "scope":"agent.invoke inventory.get quote.read"
+"access_token":"AT_wrong",
+"token_type":"Bearer",
+"expires_in":300,
+"scope":"agent.invoke inventory.get quote.read"
 }
 ```
 
-Step 2: client calls the agent.
+Step 2: client calls the agent gateway with AT_wrong. The Agent Gateway validates the signature, but denies on audience mismatch.
 
-**Client -> Agent: invoke**
+**Request: Client -> Agent GW: invoke (wrong token audience)**
 
 ```http
 POST /v1/agent/invoke HTTP/1.1
-Host: agent.example.com
-Authorization: Bearer AT_agent
+Host: agent-gw.example.com
+Authorization: Bearer AT_wrong
 Content-Type: application/json
-
 {
-  "intent_id":"ord-2026-000123",
-  "input":"Check inventory for SKU X-42 and produce a quote."
+"intent_id":"ord-2026-000124",
+"input":"Check inventory for SKU X-42 and produce a quote."
 }
 ```
 
-Step 3: agent performs OBO token exchange to obtain an MCP token (AT_mcp) scoped to the gateway and tools.
+**DENY: Agent GW -> Client: invalid_audience**
 
-**Agent -> AS: token\_exchange (OBO downscope)**
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer error="invalid_token", error_description="audience mismatch", resource="https://agent-gw.example.com"
+Content-Type: application/json
+{
+"error":"invalid_token",
+"reason":"invalid_audience",
+"expected_aud":"https://agent-gw.example.com",
+"received_aud":["https://mcp-gw.example.com"]
+}
+```
+
+
+### D.1 ALLOW: client to agent to token exchange to MCP tool
+
+Step 1: backend client obtains an agent token (AT_agent).
+
+**Request: Client -> AS: client_credentials (agent audience)**
 
 ```http
 POST /oauth2/token HTTP/1.1
 Host: as.example.com
 Content-Type: application/x-www-form-urlencoded
-
-grant_type=urn:ietf:params:oauth:grant-type:token-exchange&
-subject_token=AT_agent&
-subject_token_type=urn:ietf:params:oauth:token-type:access_token&
-audience=https%3A%2F%2Fmcp-gw.example.com&
-scope=mcp.call_tool%20inventory.get%20quote.read&
-intent_id=ord-2026-000123
+grant_type=client_credentials&
+client_id=backend_app&
+client_secret=...&
+scope=agent.invoke%20inventory.get%20quote.read&
+resource=https%3A%2F%2Fagent-gw.example.com
 ```
 
-**AS -> Agent: AT\_mcp (downscoped)**
+
+**Response: AS -> Client: AT_agent**
 
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/json
-
 {
-  "access_token":"AT_mcp",
-  "token_type":"Bearer",
-  "expires_in":60,
-  "scope":"mcp.call_tool inventory.get quote.read",
-  "issued_token_type":"urn:ietf:params:oauth:token-type:access_token"
+"access_token":"AT_agent",
+"token_type":"Bearer",
+"expires_in":300,
+"scope":"agent.invoke inventory.get quote.read"
 }
 ```
 
+
+Step 2: client calls the **agent gateway (PEP #1)**, which validates `AT_agent` and forwards to the agent runtime.
+
+**Request: Client -> Agent GW: invoke**
+
+```http
+POST /v1/agent/invoke HTTP/1.1
+Host: agent-gw.example.com
+Authorization: Bearer AT_agent
+Content-Type: application/json
+{
+"intent_id":"ord-2026-000123",
+"input":"Check inventory for SKU X-42 and produce a quote."
+}
+```
+
+
+Step 3: agent performs OBO token exchange to obtain an MCP token (AT_mcp) scoped to the gateway and tools.
+
+**Request: Agent -> AS: token_exchange (OBO downscope)**
+
+```http
+POST /oauth2/token HTTP/1.1
+Host: as.example.com
+Content-Type: application/x-www-form-urlencoded
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange&
+subject_token=AT_agent&
+subject_token_type=urn:ietf:params:oauth:token-type:access_token&
+resource=https%3A%2F%2Fmcp-gw.example.com&
+scope=mcp.call_tool%20inventory.get%20quote.read&
+intent_id=ord-2026-000123
+```
+
+
+**Response: AS -> Agent: AT_mcp (downscoped)**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+{
+"access_token":"AT_mcp",
+"token_type":"Bearer",
+"expires_in":60,
+"scope":"mcp.call_tool inventory.get quote.read",
+"issued_token_type":"urn:ietf:params:oauth:token-type:access_token"
+}
+```
+
+
 Step 4: agent calls MCP gateway, which enforces tool-level authorization.
 
-**Agent -> MCP gateway: tools/call**
+**Request: Agent -> MCP gateway: tools/call**
 
 ```http
 POST /mcp HTTP/1.1
 Host: mcp-gw.example.com
 Authorization: Bearer AT_mcp
 Content-Type: application/json
-
 {
-  "jsonrpc":"2.0",
-  "id":"d1-1",
-  "method":"tools/call",
-  "params":{
-    "name":"inventory.get",
-    "arguments":{"sku":"X-42"}
-  }
+"jsonrpc":"2.0",
+"id":"d1-1",
+"method":"tools/call",
+"params":{
+"name":"inventory.get",
+"arguments":{"sku":"X-42"}
+}
 }
 ```
 
-**MCP gateway -> Agent: allowed**
+
+**ALLOW: MCP gateway -> Agent: allowed**
 
 ```json
 {
-  "jsonrpc":"2.0",
-  "id":"d1-1",
-  "result":{
-    "sku":"X-42",
-    "available":17,
-    "warehouse":"MAD-01"
-  }
+"jsonrpc":"2.0",
+"id":"d1-1",
+"result":{
+"sku":"X-42",
+"available":17,
+"warehouse":"MAD-01"
+}
 }
 ```
+
 
 ### D.2 DENY at AS: scope escalation in token exchange
 
 Agent requests more permissions than exist in the subject token and policy.
 
-**Agent -> AS: token\_exchange (attempted scope escalation)**
+**Request: Agent -> AS: token_exchange (attempted scope escalation)**
 
 ```http
 POST /oauth2/token HTTP/1.1
 Host: as.example.com
 Content-Type: application/x-www-form-urlencoded
-
 grant_type=urn:ietf:params:oauth:grant-type:token-exchange&
 subject_token=AT_agent&
-audience=https%3A%2F%2Fmcp-gw.example.com&
+resource=https%3A%2F%2Fmcp-gw.example.com&
 scope=mcp.call_tool%20inventory.get%20payments.refund
 ```
 
-**AS -> Agent: invalid\_scope**
+
+**DENY: AS -> Agent: invalid_scope**
 
 ```http
 HTTP/1.1 400 Bad Request
 Content-Type: application/json
-
 {
-  "error":"invalid_scope",
-  "error_description":"requested permissions exceed subject token and policy",
-  "reason":"downscope_violation",
-  "policy_version":"2026-02-17.1"
+"error":"invalid_scope",
+"error_description":"requested permissions exceed subject token and policy",
+"reason":"downscope_violation",
+"policy_version":"2026-02-17.1"
 }
 ```
+
 
 ### D.3 DENY at MCP gateway: tenant namespace mismatch
 
 Token is valid for tenant `acme`, but the request targets a `globex` namespaced tool.
 
-**Agent -> MCP gateway: cross-tenant tools/call**
+**Request: Agent -> MCP gateway: cross-tenant tools/call**
 
 ```http
 POST /mcp HTTP/1.1
 Host: mcp-gw.example.com
 Authorization: Bearer AT_mcp
 Content-Type: application/json
-
 {
-  "jsonrpc":"2.0",
-  "id":"d3-1",
-  "method":"tools/call",
-  "params":{
-    "name":"globex.inventory.get",
-    "arguments":{"sku":"X-42"}
-  }
+"jsonrpc":"2.0",
+"id":"d3-1",
+"method":"tools/call",
+"params":{
+"name":"globex.inventory.get",
+"arguments":{"sku":"X-42"}
+}
 }
 ```
 
-**MCP gateway -> Agent: tenant\_mismatch**
+
+**DENY: MCP gateway -> Agent: tenant_mismatch**
 
 ```json
 {
-  "error":"access_denied",
-  "reason":"tenant_mismatch",
-  "token_tenant":"acme",
-  "requested_tool":"globex.inventory.get"
+"error":"access_denied",
+"reason":"tenant_mismatch",
+"token_tenant":"acme",
+"requested_tool":"globex.inventory.get"
 }
 ```
+
 
 ### D.4 DENY at MCP gateway: non-canonical tool name (confusable / variant)
 
 Request uses a non-canonical tool spelling. Canonicalization rejects before authorization.
 
-**Agent -> MCP gateway: tools/call (non-canonical)**
+**Request: Agent -> MCP gateway: tools/call (non-canonical)**
 
 ```http
 POST /mcp HTTP/1.1
 Host: mcp-gw.example.com
 Authorization: Bearer AT_mcp
 Content-Type: application/json
-
 {
-  "jsonrpc":"2.0",
-  "id":"d4-1",
-  "method":"tools/call",
-  "params":{
-    "name":"Inventory.Get",
-    "arguments":{"sku":"X-42"}
-  }
+"jsonrpc":"2.0",
+"id":"d4-1",
+"method":"tools/call",
+"params":{
+"name":"Inventory.Get",
+"arguments":{"sku":"X-42"}
+}
 }
 ```
 
-**MCP gateway -> Agent: non\_canonical\_tool\_name**
+
+**Response: MCP gateway -> Agent: non_canonical_tool_name**
 
 ```json
 {
-  "error":"access_denied",
-  "reason":"non_canonical_tool_name",
-  "canonical_name":"inventory.get",
-  "requested_name":"Inventory.Get"
+"error":"access_denied",
+"reason":"non_canonical_tool_name",
+"canonical_name":"inventory.get",
+"requested_name":"Inventory.Get"
 }
 ```
+
 
 ## Appendix E: Full transaction traces (client -> IdP -> agent -> MCP gateway -> MCP server)
 
@@ -2504,13 +2778,12 @@ Step 0: backend client calls the agent with an upstream token `AT_agent` (not sh
 
 Step 1: agent exchanges `AT_agent` for a short-lived multi-resource MCP token, requesting two resources.
 
-**Agent -> AS: token\_exchange requesting two MCP resources**
+**Request: Agent -> AS: token_exchange requesting two MCP resources**
 
 ```http
 POST /oauth2/token HTTP/1.1
 Host: as.example.com
 Content-Type: application/x-www-form-urlencoded
-
 grant_type=urn:ietf:params:oauth:grant-type:token-exchange&
 subject_token=AT_agent&
 subject_token_type=urn:ietf:params:oauth:token-type:access_token&
@@ -2520,75 +2793,78 @@ scope=list.accounts%20payments.transfer&
 intent_id=txn-2026-02-19-0001
 ```
 
-**AS -> Agent: AT\_mcp\_multi (JWT payload sketch)**
+
+**Response: AS -> Agent: AT_mcp_multi (JWT payload sketch)**
 
 ```json
 {
-  "aud":[
-    "https://mcp-a.example.com/mcp",
-    "https://mcp-b.example.com/mcp"
-  ],
-  "scope":"list.accounts payments.transfer",
-  "mcp_toolset":[
-    {"rs":"https://mcp-a.example.com/mcp","tools":["list.accounts"]},
-    {"rs":"https://mcp-b.example.com/mcp","tools":["payments.transfer"]}
-  ],
-  "exp":1760669100,
-  "act":{"sub":"agent_runtime"}
+"aud":[
+"https://mcp-a.example.com/mcp",
+"https://mcp-b.example.com/mcp"
+],
+"scope":"list.accounts payments.transfer",
+"mcp_toolset":[
+{"rs":"https://mcp-a.example.com/mcp","tools":["list.accounts"]},
+{"rs":"https://mcp-b.example.com/mcp","tools":["payments.transfer"]}
+],
+"exp":1760669100,
+"act":{"sub":"agent_runtime"}
 }
 ```
 
+
 Step 2: agent calls MCP-A with `list.accounts` and is allowed.
 
-**Agent -> MCP-A: tools/call (allowed)**
+**ALLOW: Agent -> MCP-A: tools/call (allowed)**
 
 ```http
 POST /mcp HTTP/1.1
 Host: mcp-a.example.com
 Authorization: Bearer AT_mcp_multi
 Content-Type: application/json
-
 {
-  "jsonrpc":"2.0",
-  "id":"e1-1",
-  "method":"tools/call",
-  "params":{"name":"list.accounts","arguments":{"limit":10}}
+"jsonrpc":"2.0",
+"id":"e1-1",
+"method":"tools/call",
+"params":{"name":"list.accounts","arguments":{"limit":10}}
 }
 ```
 
+
 Step 3: agent calls MCP-B with `payments.transfer` and is allowed.
 
-**Agent -> MCP-B: tools/call (allowed)**
+**ALLOW: Agent -> MCP-B: tools/call (allowed)**
 
 ```http
 POST /mcp HTTP/1.1
 Host: mcp-b.example.com
 Authorization: Bearer AT_mcp_multi
 Content-Type: application/json
-
 {
-  "jsonrpc":"2.0",
-  "id":"e1-2",
-  "method":"tools/call",
-  "params":{"name":"payments.transfer","arguments":{"amount":"10.00","currency":"EUR"}}
+"jsonrpc":"2.0",
+"id":"e1-2",
+"method":"tools/call",
+"params":{"name":"payments.transfer","arguments":{"amount":"10.00","currency":"EUR"}}
 }
 ```
+
 
 ### E.2 DENY: same token, wrong tool for the selected resource
 
 The agent mistakenly sends `payments.transfer` to MCP-A. Audience membership succeeds (because MCP-A is in `aud[]`), but the tool binding check fails:
 
-**MCP-A PEP: denied (tool not permitted for MCP-A)**
+**DENY: MCP-A PEP: denied (tool not permitted for MCP-A)**
 
 ```json
 {
-  "error":"access_denied",
-  "reason":"insufficient_tool_scope",
-  "aud":"https://mcp-a.example.com/mcp",
-  "requested_tool":"payments.transfer",
-  "permitted_tools":["list.accounts"]
+"error":"access_denied",
+"reason":"insufficient_tool_scope",
+"aud":"https://mcp-a.example.com/mcp",
+"requested_tool":"payments.transfer",
+"permitted_tools":["list.accounts"]
 }
 ```
+
 
 ### E.3 DENY: audience mismatch against a canonicalized resource identifier
 
@@ -2625,7 +2901,8 @@ Gateway patterns (agentgateway / Solo / Envoy external auth):
 - agentgateway: MCP authorization (mcpAuthorization): https://agentgateway.dev/docs/mcp/mcp-authz/
 - agentgateway: External authorization (extAuthz): https://agentgateway.dev/docs/configuration/security/external-authz/
 - Envoy: External authorization filter (ext_authz): https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_authz_filter
-- Solo.io docs: Secure access to MCP servers: https://docs.solo.io/gateway/2.0.x/ai/mcp/mcp-access/
+- Solo.io docs: Secure access to MCP servers: https://docs.solo.io/agentgateway/2.1.x/mcp/mcp-access/
+- Solo.io docs: Control access to tools: https://docs.solo.io/agentgateway/2.1.x/mcp/tool-access/
 - Solo.io docs: BYO external auth service (Envoy ext_authz proto): https://docs.solo.io/gateway/2.0.x/security/extauth/byo-ext-auth-service/
 - Solo.io MCP Academy lab (multiplex + auth policy): https://www.solo.io/mcp-academy/multiplex-mcp-servers-auth-kgateway-agentgateway
 - Solo.io blog: Overhaul of Agent Gateway supporting A2A, MCP, and Kubernetes Gateway API: https://www.solo.io/blog/updated-a2a-and-mcp-gateway
